@@ -1,0 +1,357 @@
+---
+title: "Tiny Decomposition tutorial"
+author: "Tim Riffe"
+date: "3 Dec. 2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+In this tiny tutorial I'd like to demonstrate a few approaches to coding decompositions. We'll cover Kitagawa, Arriaga, Between-Within, and generalized decomposition. This will usually involve function-writing, so for this reason let's review how to write a function. 
+
+## Brief anatomy
+```{r, eval = FALSE}
+function_name <- function(arg1, arg2, ...){
+  # this is where you calculate things with your arguments,
+  result <- arg1 ^ arg2 + arg1 # bla bla
+  
+  # it can be as big and complicated as you want!
+  
+  # eventually calculating a result 
+	return(result)
+}
+
+function_name(arg1 = 4, arg2 = 5)
+```
+
+## Some things to install:
+
+To install packages from github you might need to install the `remotes` package first. If you're on a Windows machine you should also install (RTools)[https://cran.r-project.org/bin/windows/Rtools/] beforehand.
+```{r}
+# install.packages("readr")
+# install.packages("tidyverse")
+# remotes::install_github("timriffe/LifeIneq")
+# remotes::install_github("timriffe/LifeIneqDecomp")
+# remotes::install_github("timriffe/DemoDecomp")
+library(readr)
+library(tidyverse)
+library(LifeIneq)       # some handy lifetable inequality measures
+library(LifeIneqDecomp) # between-within decompositions of various of these
+library(DemoDecomp)     # three generalized decomposition methods
+```
+
+
+## Example data
+
+I've copied raw rates `Mx` and exposures `Px` from 1950 and 2000 Spain, Male, Female, and Total from the [HMD](https://www.mortality.org/). You can read them in like so:
+
+```{r}
+ES <- read_csv("example_data.csv")
+```
+I've pre-arranged the data to make it easier to do decompositions. We'll compare 2000 with 1950 in the example, so these are found side by side. First some helper functions.
+
+## Small functions
+
+These are some lazy lifetable transformations that we'll use here and there to make things easy. You could swap them out with more rigorous ones. These have names that follow a memorable pattern.
+
+```{r}
+# Use continuous formula in discrete setting,
+# implies error, but small here.
+mx_to_lx <- function(mx){
+  mx[is.na(mx)] <- 0
+  lx <- exp(-cumsum(mx))
+  lx <- c(1,lx)
+  lx[1:length(mx)]
+}
+
+# minus first difference
+lx_to_dx <- function(lx){
+  -diff(c(lx,0))
+}
+
+# Linear approximation
+lx_to_Lx <- function(lx){
+   (lx + c(lx[-1],0)) / 2
+}  
+
+# Can be used to turn Lx into Tx
+rcumsum <- function(x){
+  rev(cumsum(rev(x)))
+}
+
+lx_to_ex <- function(lx){
+  Lx <- lx_to_Lx(lx) # this is "modularity"
+  Tx <- rcumsum(Lx) 
+  ex <- Tx / lx
+  ex
+}
+
+```
+
+Here's some ways to use functions like these
+
+```{r}
+mx <- ES %>% 
+  filter(Sex == "Total") %>% 
+  pull(Mx_1950)
+
+plot(mx_to_lx(mx),type='l')
+
+# or in succession 
+mx %>% mx_to_lx() %>% lx_to_ex()
+
+# or in the tidy way:
+ES %>% 
+  group_by(Sex) %>% 
+  mutate(lx_1950 = mx_to_lx(Mx_1950))
+```
+
+## Arriaga
+The so-called [Arriaga](https://link.springer.com/article/10.2307/2061029) decomposition technique is used to measure the contribution of differences in each age group to a difference in life expectancy. 
+
+In a paper, you'd probably see the Arriaga-style decomp written out like so (if it's written at all):
+
+$$
+_n\Delta_x = \frac{l_x^{1950} }{l_0^{1950}} \Big( \frac{_nL_x^{2000}}{l_x^{2000}} -\frac{_nL_x^{1950}}{l_x^{1950}} \Big) + \frac{T_{x+n}^{2000}}{l_0^{1950}} \Big( \frac{l_x^{1950}}{l_x^{2000}} - \frac{l_{x+n}^{1950}}{l_{x+n}^{2000}} \Big)
+$$
+Where $_n\Delta_x$ is the contribution form mortality differences in age $x$ To keep things legible in the code, we'll call the left side the direct effect and the right side the indirect effect. Age groups are $n$ years wide, and we need that part of the notation to denote the "next" age group. $l$, $L$, and $T$ are the lifetable columns, which we'll approximate with the tiny functions we just wrote. `lead()` is our trick to get to the age group $x+n$.
+
+We'll just generate the columns we need for Arriaga in the tidy way and perform the calcs like so:
+
+```{r}
+ES_Arr <- ES %>% 
+  group_by(Sex) %>% 
+  mutate(lx_1950 = mx_to_lx(Mx_1950),
+         lx_2000 = mx_to_lx(Mx_2000),
+         Lx_1950 = lx_to_Lx(lx_1950),
+         Lx_2000 = lx_to_Lx(lx_2000),
+         Tx_1950 = rcumsum(Lx_1950),
+         Tx_2000 = rcumsum(Lx_2000)) %>% 
+  
+  # Now starts the Arriaga decomp, separated, just because
+  
+   mutate(direct = lx_1950 * (Lx_2000 / lx_2000 - Lx_1950 / lx_1950),
+         indirect = lead(Tx_2000) * 
+           (lx_1950 / lx_2000 - 
+              lead(lx_1950) / lead(lx_2000)),
+         # impute 0 in the final NA
+         indirect = ifelse(is.na(indirect),0,indirect),
+         total = direct + indirect) %>% 
+  ungroup() %>% 
+  select(Sex, Age, direct, indirect, total) 
+
+# verify it gives an exact result:
+ES_Arr %>% 
+  group_by(Sex) %>% 
+  summarize(Delta = sum(total))
+
+# yup
+ES %>% 
+  group_by(Sex) %>% 
+  mutate(ex_1950 = mx_to_lx(Mx_1950) %>% lx_to_ex(),
+         ex_2000 = mx_to_lx(Mx_2000) %>% lx_to_ex(),
+         Delta = ex_2000-ex_1950) %>% 
+  filter(Age == 0) %>% 
+  select(Sex, Delta)
+```
+
+Let's have a look, OK it's mostly infants.
+
+```{r}
+ES_Arr %>% 
+  pivot_longer(direct:total, names_to = "effect", values_to = "cx") %>% 
+  filter(effect != "total") %>% 
+  ggplot(aes(x = Age, y = cx, color = effect)) +
+  geom_line() +
+  facet_wrap(~Sex)
+```
+
+A kinder-to-yourself (more portable, findable) way of doing just the same would make and Arriaga function that just starts from `Mx` values, like so:
+
+```{r}
+my_arriaga <- function(mx1, mx2){
+  lx1 <- mx_to_lx(mx1)
+  lx2 <- mx_to_lx(mx2)
+  Lx1 <- lx_to_Lx(lx1)
+  Lx2 <- lx_to_Lx(lx2)
+  Tx1 <- rcumsum(Lx1)
+  Tx2 <- rcumsum(Lx2)
+  
+  direct   <- lx1 * (Lx2 / lx2 - Lx1 / lx1)
+  indirect <- lead(Tx2) * (lx1 / lx2 - lead(lx1) / lead(lx2))
+         # impute 0 in the final NA
+  indirect <- ifelse(is.na(indirect),0,indirect)
+  total    <- direct + indirect
+  return(total)
+}
+
+# usage:
+ES %>% 
+  group_by(Sex) %>% 
+  mutate(deltax = my_arriaga(Mx_1950, Mx_2000)) %>% 
+  summarize(Delta = sum(deltax)) # saem result
+
+```
+
+## Generalized decomposition
+
+I use Arriaga as an example because it's widely taught, it's exact, and because we can replicate it using generalized techniques in order to show that approach. Here we see the usage of three different general decomposition techniques:
+
+- [Horiuchi et al](https://link.springer.com/article/10.1353/dem.0.0033), with the `horiuchi()` function.
+- [Andreev et al](https://www.demographic-research.org/volumes/vol7/14/), with the `stepwise_replacement()` function.
+- [Caswell](https://www.sciencedirect.com/science/article/abs/pii/0304380089900197), with the `ltre()` function.
+
+I'll give my hot take on the differences between them in the presentation. Their usage is very similar in the `DemoDecomp` package. Each of these methods can do a full parameter decomposition of (arbitrarily) complicated functions. For our Arriaga comparison, we just need to write a function that takes us from a single **vector of parameters** ($M_x$) to the desired result ($e_0$), like so:
+
+```{r}
+mx_to_e0 <- function(mx){
+  mx %>% mx_to_lx %>% lx_to_ex %>% '['(1)
+}
+# usage:
+ES %>% filter(Sex == "Total") %>% pull(Mx_1950) %>% mx_to_e0()
+```
+
+Our arbitrary function becomes an argument to any of the three general decomposition functions:
+```{r}
+# horiuchi, stepwise_replacement, and ltre all come from DemoDecomp
+Dec_compare <-
+  ES %>% 
+  group_by(Sex) %>% 
+  mutate(arr = my_arriaga(Mx_1950, Mx_2000),
+         hor = horiuchi(mx_to_e0, Mx_1950, Mx_2000, N = 20),
+         and = stepwise_replacement(mx_to_e0, Mx_1950, Mx_2000, direction = "both"),
+         cas = ltre(mx_to_e0, Mx_1950, Mx_2000)) %>% 
+  ungroup() %>% 
+  select(Sex, Age, arr:cas) 
+```
+
+Let's compare:
+```{r}
+# 1) compare sums:
+Dec_compare %>% 
+  group_by(Sex) %>% 
+  summarize(arr = sum(arr), 
+            hor = sum(hor),
+            and = sum(and),
+            cas = sum(cas))
+
+# 2) compare patterns:
+Dec_compare %>% 
+  pivot_longer(arr:cas, 
+               names_to = "method", 
+               values_to = "delta") %>% 
+  ggplot(aes(x = Age, y = delta, color = method)) + 
+  geom_line() +
+  xlim(5,80) +
+  ylim(0,.4) +
+  facet_wrap(~Sex)
+
+```
+
+Notes: 
+- `horiuchi()` is arbitrarily exact as you increase the parameter `N`, but there is a speed penalty for larger N.
+- the `stepwise_replacement()` algorithm is faster, but the order in which parameters get treated is a parameter you need to set, and which affects results for individual parameter estimates. The sum is always constrained, however.
+- `ltre()` approach can also be faster if you have an analytical partial derivative function, otherwise it uses numerical derivatives under the hood, and these are approximate.
+- analytical solutions are always computationally efficient, but you might need to invent them, so there's that.
+
+## Bespoke, the case of between-within lifetable decompositions
+
+I'm including a lifetable between-within example here because there happens to be a package (in development) that does this for a nice selection of life disparity measures. These functions require specific lifetable columns. They are not based just on $M_x$, unlike the above. So we'll need to beef out the lifetable columns like previously. Example disparity measures include variance, gini, e-dagger, mld, theil, and so forth, all available in the `LifeIneq` package, which we installed from GitHub
+
+```{r}
+lx_to_dx <- function(lx){
+  -diff(c(lx,0))
+}
+
+ES_gini <-
+  ES %>% 
+  group_by(Sex) %>% 
+  mutate(ax = .5, # still lazy...
+         lx_1950 = mx_to_lx(Mx_1950),
+         lx_2000 = mx_to_lx(Mx_2000),
+         dx_1950 = lx_to_dx(lx_1950),
+         dx_2000 = lx_to_dx(lx_2000),
+         ex_1950 = lx_to_ex(lx_1950),
+         ex_2000 = lx_to_ex(lx_2000),
+         gini_1950 = ineq_gini(age = Age,
+                               lx = lx_1950,
+                               ex = ex_1950,
+                               ax = ax),
+         gini_2000 = ineq_gini(age = Age,
+                               lx = lx_2000,
+                               ex = ex_2000,
+                               ax = ax)
+         )
+# the age patterns are condition. i.e. imagine a cohort 'born' at age 50.
+ES_gini %>% 
+  ggplot(aes(x = Age, y = gini_2000, color = Sex)) +
+  geom_line()
+```
+
+We can decompose any of these ages, here's the basic function usage:
+
+```{r}
+the_goods <- ES_gini %>% ungroup() %>% filter(Sex == "Total")
+ax <- the_goods %>% select(contains("ax")) %>% as.matrix()
+ax <- cbind(ax,ax)
+lx <- the_goods %>% select(contains("lx")) %>% as.matrix()
+dx <- the_goods %>% select(contains("dx")) %>% as.matrix()
+ex <- the_goods %>% select(contains("ex_")) %>% as.matrix()
+
+bw_decomp(age = 0:110, 
+          ax,
+          dx,
+          lx,
+          ex,
+          prop = c(.5, .5),
+          method = "gini")
+```
+
+So let's imagine ourselves a wrapper function that returns just the total gini difference (`tot`), the between (`B`) and the within (`W`). I guess to make it easier we can make it start from just $M_x$. This example is rather absurd. We'll have a population made half of the 1950 synthetic cohort and half of the 2000 synthetic cohort. That's silly. It'd make more sense to do decomposition of the total as composed by sex, or something like that.
+
+```{r}
+bw_gini_easy <- function(age, mx1, mx2, prop = c(.5,.5)){
+         lx1 <- mx_to_lx(mx1)
+         lx2 <- mx_to_lx(mx2)
+         dx1 <- lx_to_dx(lx1)
+         dx2 <- lx_to_dx(lx2)
+         ex1 <- lx_to_ex(lx1)
+         ex2 <- lx_to_ex(lx2)
+         
+         lx  <- cbind(lx1,lx2)
+         dx  <- cbind(dx1,dx2)
+         ex  <- cbind(ex1,ex2)
+         ax  <- lx * 0 + .5
+         
+         bw <-  bw_decomp(age = age, 
+                          ax = ax,
+                          dx = dx,
+                          lx = lx,
+                          ex = ex,
+                          prop = prop,
+                          method = "gini")
+         tibble(gini = bw$tot, 
+                gini_b = bw$B,
+                gini_w = bw$W)
+          
+}
+ES %>% 
+  group_by(Sex) %>% 
+  do(bw_gini_easy(age = .data$Age,
+                  mx1 = .data$Mx_1950,
+                  mx2 = .data$Mx_2000))
+
+```
+
+OK, I'll post an issue on GitHub re the `NaN` for males and fix whatever's going on ASAP, haha.
+
+
+
+
+
+
+
